@@ -1,91 +1,128 @@
-'use strict'
-const map = new Map
+/* global self ReadableStream Response */
+
+self.addEventListener('install', () => {
+  self.skipWaiting()
+})
+
+self.addEventListener('activate', event => {
+  event.waitUntil(self.clients.claim())
+})
+
+const map = new Map()
 
 // This should be called once per download
 // Each event has a dataChannel that the data will be piped through
 self.onmessage = event => {
-    // Create a uniq link for the download
-    let uniqLink = self.registration.scope + 'intercept-me-nr' + Math.random()
-	let port = event.ports[0]
+  // We send a heartbeat every x secound to keep the
+  // service worker alive if a transferable stream is not sent
+  if (event.data === 'ping') {
+    return
+  }
 
-    let p = new Promise((resolve, reject) => {
-        let stream = createStream(resolve, reject, port)
-		map.set(uniqLink, [stream, event.data])
-		port.postMessage({download: uniqLink})
+  const data = event.data
+  const downloadUrl = data.url || self.registration.scope + Math.random() + '/' + (typeof data === 'string' ? data : data.filename)
+  const port = event.ports[0]
+  const metadata = new Array(3) // [stream, data, port]
 
-		// Mistage adding this and have streamsaver.js rely on it
-		// depricated as from 0.2.1
-		port.postMessage({debug: 'Mocking a download request'})
-    })
+  metadata[1] = data
+  metadata[2] = port
 
-    // Beginning in Chrome 51, event is an ExtendableMessageEvent, which supports
-    // the waitUntil() method for extending the lifetime of the event handler
-    // until the promise is resolved.
-    if ('waitUntil' in event) {
-        event.waitUntil(p)
+  // Note to self:
+  // old streamsaver v1.2.0 might still use `readableStream`...
+  // but v2.0.0 will always transfer the stream throught MessageChannel #94
+  if (event.data.readableStream) {
+    metadata[0] = event.data.readableStream
+  } else if (event.data.transferringReadable) {
+    port.onmessage = evt => {
+      port.onmessage = null
+      metadata[0] = evt.data.readableStream
     }
+  } else {
+    metadata[0] = createStream(port)
+  }
 
-    // Without support for waitUntil(), there's a chance that if the promise chain
-    // takes "too long" to execute, the service worker might be automatically
-    // stopped before it's complete.
+  map.set(downloadUrl, metadata)
+  port.postMessage({ download: downloadUrl })
 }
 
-function createStream(resolve, reject, port){
-    // ReadableStream is only supported by chrome 52
-    var bytesWritten = 0
-    return new ReadableStream({
-		start(controller) {
-			// When we receive data on the messageChannel, we write
-			port.onmessage = ({data}) => {
-				if (data === 'end') {
-                    resolve()
-                    return controller.close()
-                }
+function createStream (port) {
+  // ReadableStream is only supported by chrome 52
+  return new ReadableStream({
+    start (controller) {
+      // When we receive data on the messageChannel, we write
+      port.onmessage = ({ data }) => {
+        if (data === 'end') {
+          return controller.close()
+        }
 
-				if (data === 'abort') {
-					resolve()
-					controller.error('Aborted the download')
-					return
-                }
+        if (data === 'abort') {
+          controller.error('Aborted the download')
+          return
+        }
 
-				controller.enqueue(data)
-                bytesWritten += data.byteLength
-                port.postMessage({ bytesWritten })
-			}
-		},
-		cancel() {
-			console.log("user aborted")
-		}
-	})
+        controller.enqueue(data)
+      }
+    },
+    cancel () {
+      console.log('user aborted')
+    }
+  })
 }
-
 
 self.onfetch = event => {
-	let url = event.request.url
-	let hijacke = map.get(url)
-	let listener, filename, headers
+  const url = event.request.url
 
-	console.log("Handleing ", url)
+  // this only works for Firefox
+  if (url.endsWith('/ping')) {
+    return event.respondWith(new Response('pong'))
+  }
 
-	if(!hijacke) return null
+  const hijacke = map.get(url)
 
-	let [stream, data] = hijacke
+  if (!hijacke) return null
 
-	map.delete(url)
+  const [ stream, data, port ] = hijacke
 
-	filename = typeof data === 'string' ? data : data.filename
+  map.delete(url)
 
-	// Make filename RFC5987 compatible
-	filename = encodeURIComponent(filename)
-		.replace(/['()]/g, escape)
-		.replace(/\*/g, '%2A')
+  // Not comfortable letting any user control all headers
+  // so we only copy over the length & disposition
+  const responseHeaders = new Headers({
+    'Content-Type': 'application/octet-stream; charset=utf-8',
 
-	headers = {
-		'Content-Type': 'application/octet-stream; charset=utf-8',
-		'Content-Disposition': "attachment; filename*=UTF-8''" + filename
-	}
+    // To be on the safe side, The link can be opened in a iframe.
+    // but octet-stream should stop it.
+    'Content-Security-Policy': "default-src 'none'",
+    'X-Content-Security-Policy': "default-src 'none'",
+    'X-WebKit-CSP': "default-src 'none'",
+    'X-XSS-Protection': '1; mode=block'
+  })
 
-	if(data.size) headers['Content-Length'] = data.size
+  let headers = new Headers(data.headers || {})
 
-	event.respondWith(new Response(stream, { headers }))
+  if (headers.has('Content-Length')) {
+    responseHeaders.set('Content-Length', headers.get('Content-Length'))
+  }
+
+  if (headers.has('Content-Disposition')) {
+    responseHeaders.set('Content-Disposition', headers.get('Content-Disposition'))
+  }
+
+  // data, data.filename and size should not be used anymore
+  if (data.size) {
+    console.warn('Depricated')
+    responseHeaders.set('Content-Length', data.size)
+  }
+
+  let fileName = typeof data === 'string' ? data : data.filename
+  if (fileName) {
+    console.warn('Depricated')
+    // Make filename RFC5987 compatible
+    fileName = encodeURIComponent(fileName).replace(/['()]/g, escape).replace(/\*/g, '%2A')
+    responseHeaders.set('Content-Disposition', "attachment; filename*=UTF-8''" + fileName)
+  }
+
+  event.respondWith(new Response(stream, { headers: responseHeaders }))
+
+  port.postMessage({ debug: 'Download started' })
 }
